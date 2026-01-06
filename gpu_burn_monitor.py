@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 """
-GPU Burn Monitor - 監控 gpu_burn 測試並記錄系統數據
-輸出 CSV + 圖表
+GPU Burn Monitor v2 - 監控 gpu_burn 測試並記錄系統數據
 """
 
 import subprocess
@@ -13,8 +12,9 @@ import sys
 from datetime import datetime
 from pathlib import Path
 from dataclasses import dataclass, asdict
-import threading
+from threading import Thread, Lock
 import re
+import select
 
 @dataclass
 class SensorData:
@@ -58,6 +58,8 @@ class GPUBurnMonitor:
         self.running = False
         self.start_time = None
         self.tflops: dict = {}
+        self.tflops_lock = Lock()
+        self.gpu_count = 8  # 預設，會自動偵測
         
     def get_gpu_count(self) -> int:
         try:
@@ -65,7 +67,7 @@ class GPUBurnMonitor:
                                capture_output=True, text=True, timeout=10)
             return int(r.stdout.strip().split('\n')[0])
         except:
-            return 1
+            return 8
     
     def get_gpu_data(self) -> list:
         try:
@@ -126,23 +128,50 @@ class GPUBurnMonitor:
                 print(f"Warning: Could not set power limit for GPU {i}: {e}")
     
     def parse_tflops(self, line: str):
-        # 格式: proc'd: 85 (18624 Gflop/s) - 43 (18937 Gflop/s) - ...
-        if 'proc\'d:' in line or 'Gflop/s' in line or 'Tflop/s' in line:
-            # 找出所有 (數字 Gflop/s) 或 (數字 Tflop/s)
-            matches = re.findall(r'\((\d+\.?\d*)\s*(G|T)flop/s\)', line, re.IGNORECASE)
-            for gpu_id, (val, unit) in enumerate(matches):
-                val = float(val)
-                if unit.upper() == 'G':
-                    val /= 1000.0  # 轉換為 TFLOPS
+        """
+        解析多種 gpu-burn 輸出格式:
+        1. proc'd: 85 (18624 Gflop/s) - 43 (18937 Gflop/s) - ...
+        2. GPU 0: xxxx Gflop/s
+        3. 100.0%  proc'd: ...
+        """
+        # 格式 1: (數字 Gflop/s) 連續出現
+        matches = re.findall(r'\((\d+\.?\d*)\s*(G|T)flop/s\)', line, re.IGNORECASE)
+        if matches:
+            with self.tflops_lock:
+                for gpu_id, (val, unit) in enumerate(matches):
+                    val = float(val)
+                    if unit.upper() == 'G':
+                        val /= 1000.0
+                    self.tflops[gpu_id] = val
+            return
+        
+        # 格式 2: GPU N: xxxx Gflop/s
+        m = re.search(r'GPU\s*(\d+)[:\s]+(\d+\.?\d*)\s*(G|T)flop', line, re.IGNORECASE)
+        if m:
+            gpu_id = int(m.group(1))
+            val = float(m.group(2))
+            unit = m.group(3).upper()
+            if unit == 'G':
+                val /= 1000.0
+            with self.tflops_lock:
                 self.tflops[gpu_id] = val
     
     def read_output(self):
-        while self.running and self.process and self.process.poll() is None:
-            line = self.process.stdout.readline()
-            if line:
-                line = line.strip()
-                self.parse_tflops(line)
-                print(f"[gpu_burn] {line}")
+        """持續讀取 gpu_burn 輸出"""
+        while self.running:
+            if self.process is None or self.process.poll() is not None:
+                break
+            try:
+                line = self.process.stdout.readline()
+                if line:
+                    line = line.strip()
+                    if line:
+                        self.parse_tflops(line)
+                        # 只印重要訊息，避免畫面混亂
+                        if 'error' in line.lower() or 'GPU' in line or 'proc\'d' in line.lower():
+                            print(f"[gpu_burn] {line}")
+            except:
+                break
     
     def collect(self) -> list:
         ts = datetime.now().isoformat()
@@ -158,6 +187,9 @@ class GPUBurnMonitor:
         mem_pwr = self.get_ipmi_sensor(['mem power', 'memory power', 'dimm power'])
         
         samples = []
+        with self.tflops_lock:
+            current_tflops = dict(self.tflops)
+        
         for gpu in gpus:
             s = SensorData(
                 timestamp=ts,
@@ -170,7 +202,7 @@ class GPUBurnMonitor:
                 gpu_mem_used_mb=gpu['mem_used'],
                 gpu_mem_total_mb=gpu['mem_total'],
                 gpu_util_pct=gpu['util'],
-                gpu_tflops=round(self.tflops.get(gpu['id'], 0), 3),
+                gpu_tflops=round(current_tflops.get(gpu['id'], 0), 3),
                 inlet_temp_c=inlet,
                 exhaust_temp_c=exhaust,
                 cpu_temp_c=cpu_temp,
@@ -183,6 +215,9 @@ class GPUBurnMonitor:
         return samples
     
     def run(self) -> Path:
+        self.gpu_count = self.get_gpu_count()
+        print(f"Detected {self.gpu_count} GPUs")
+        
         if self.power_limit:
             self.set_power_limit(self.power_limit)
         
@@ -208,15 +243,26 @@ class GPUBurnMonitor:
         
         print(f"Starting: {' '.join(cmd)}")
         print(f"Output: {csv_path}")
-        print("-" * 60)
+        print("-" * 70)
         
-        self.process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                                         text=True, bufsize=1)
+        # 啟動 gpu_burn，合併 stdout 和 stderr
+        self.process = subprocess.Popen(
+            cmd, 
+            stdout=subprocess.PIPE, 
+            stderr=subprocess.STDOUT,
+            text=True, 
+            bufsize=1,
+            universal_newlines=True
+        )
         self.running = True
         self.start_time = time.time()
         
-        reader = threading.Thread(target=self.read_output)
+        # 啟動讀取執行緒
+        reader = Thread(target=self.read_output, daemon=True)
         reader.start()
+        
+        # 等待 gpu_burn 初始化
+        time.sleep(3)
         
         try:
             while self.process.poll() is None:
@@ -225,7 +271,12 @@ class GPUBurnMonitor:
                 
                 if samples:
                     s = samples[0]
-                    print(f"\r[{s.elapsed_seconds:6.1f}s] GPU0: {s.gpu_temp_c:5.1f}°C {s.gpu_power_w:6.1f}W {s.gpu_tflops:6.2f}TF | "
+                    # 計算總 TFLOPS
+                    with self.tflops_lock:
+                        total_tflops = sum(self.tflops.values())
+                    
+                    print(f"\r[{s.elapsed_seconds:6.1f}s] GPU0: {s.gpu_temp_c:5.1f}°C {s.gpu_power_w:6.1f}W | "
+                          f"TFLOPS: {s.gpu_tflops:6.2f} (Total: {total_tflops:6.2f}) | "
                           f"Inlet:{s.inlet_temp_c:5.1f}°C PSU:{s.psu_power_w:6.0f}W", end="", flush=True)
                 
                 time.sleep(self.interval)
@@ -235,11 +286,14 @@ class GPUBurnMonitor:
                 self.process.terminate()
         finally:
             self.running = False
-            reader.join(timeout=5)
+            reader.join(timeout=2)
         
         # 儲存 CSV
         self.save_csv(csv_path)
         print(f"\n\nSaved: {csv_path}")
+        
+        # 印出統計
+        self.print_stats()
         
         return csv_path
     
@@ -252,6 +306,28 @@ class GPUBurnMonitor:
             w.writeheader()
             for r in self.data:
                 w.writerow(asdict(r))
+    
+    def print_stats(self):
+        if not self.data:
+            return
+        
+        temps = [d.gpu_temp_c for d in self.data]
+        powers = [d.gpu_power_w for d in self.data]
+        tflops_vals = [d.gpu_tflops for d in self.data if d.gpu_tflops > 0]
+        
+        print("\n" + "=" * 50)
+        print("Statistics:")
+        print("=" * 50)
+        print(f"  Duration:       {self.data[-1].elapsed_seconds:.0f}s")
+        print(f"  GPU Count:      {self.gpu_count}")
+        print(f"  Max GPU Temp:   {max(temps):.1f}°C")
+        print(f"  Avg GPU Temp:   {sum(temps)/len(temps):.1f}°C")
+        print(f"  Max GPU Power:  {max(powers):.1f}W")
+        print(f"  Avg GPU Power:  {sum(powers)/len(powers):.1f}W")
+        if tflops_vals:
+            print(f"  Max TFLOPS:     {max(tflops_vals):.2f}")
+            print(f"  Avg TFLOPS:     {sum(tflops_vals)/len(tflops_vals):.2f}")
+        print("=" * 50)
 
 
 def generate_charts(csv_path: str):
@@ -271,7 +347,6 @@ def generate_charts(csv_path: str):
     gpu_ids = sorted(df['gpu_id'].unique())
     colors = plt.cm.tab10.colors
     
-    # 建立圖表目錄
     chart_dir = csv_path.parent / f"{csv_path.stem}_charts"
     chart_dir.mkdir(exist_ok=True)
     
@@ -314,107 +389,35 @@ def generate_charts(csv_path: str):
     fig.savefig(chart_dir / '03_gpu_tflops.png', dpi=150, bbox_inches='tight')
     plt.close()
     
-    # 4. GPU 風扇
-    fig, ax = plt.subplots(figsize=(12, 6))
-    for i, gid in enumerate(gpu_ids):
-        gdf = df[df['gpu_id'] == gid]
-        ax.plot(gdf['elapsed_seconds'], gdf['gpu_fan_pct'], label=f'GPU {gid}', color=colors[i % 10])
-    ax.set_xlabel('Time (s)')
-    ax.set_ylabel('Fan Speed (%)')
-    ax.set_title('GPU Fan Speed')
-    ax.legend(loc='upper right')
-    ax.grid(True, alpha=0.3)
-    fig.savefig(chart_dir / '04_gpu_fan.png', dpi=150, bbox_inches='tight')
-    plt.close()
+    # 4. 總覽
+    fig, axes = plt.subplots(2, 2, figsize=(14, 10))
     
-    # 5. 系統溫度
-    sdf = df[df['gpu_id'] == gpu_ids[0]]
-    fig, ax = plt.subplots(figsize=(12, 6))
-    if sdf['inlet_temp_c'].any():
-        ax.plot(sdf['elapsed_seconds'], sdf['inlet_temp_c'], label='Inlet', color='blue')
-    if sdf['exhaust_temp_c'].any():
-        ax.plot(sdf['elapsed_seconds'], sdf['exhaust_temp_c'], label='Exhaust', color='red')
-    if sdf['cpu_temp_c'].any():
-        ax.plot(sdf['elapsed_seconds'], sdf['cpu_temp_c'], label='CPU', color='green')
-    ax.set_xlabel('Time (s)')
-    ax.set_ylabel('Temperature (°C)')
-    ax.set_title('System Temperature')
-    ax.legend(loc='upper right')
-    ax.grid(True, alpha=0.3)
-    fig.savefig(chart_dir / '05_sys_temp.png', dpi=150, bbox_inches='tight')
-    plt.close()
-    
-    # 6. 系統功耗
-    fig, ax = plt.subplots(figsize=(12, 6))
-    if sdf['psu_power_w'].any():
-        ax.plot(sdf['elapsed_seconds'], sdf['psu_power_w'], label='PSU Total', color='orange')
-    if sdf['cpu_power_w'].any():
-        ax.plot(sdf['elapsed_seconds'], sdf['cpu_power_w'], label='CPU', color='blue')
-    if sdf['mem_power_w'].any():
-        ax.plot(sdf['elapsed_seconds'], sdf['mem_power_w'], label='Memory', color='green')
-    if sdf['fan_power_w'].any():
-        ax.plot(sdf['elapsed_seconds'], sdf['fan_power_w'], label='Fans', color='cyan')
-    ax.set_xlabel('Time (s)')
-    ax.set_ylabel('Power (W)')
-    ax.set_title('System Power')
-    ax.legend(loc='upper right')
-    ax.grid(True, alpha=0.3)
-    fig.savefig(chart_dir / '06_sys_power.png', dpi=150, bbox_inches='tight')
-    plt.close()
-    
-    # 7. 總覽圖
-    fig, axes = plt.subplots(2, 3, figsize=(18, 10))
-    
-    # GPU Temp
     ax = axes[0, 0]
     for i, gid in enumerate(gpu_ids):
         gdf = df[df['gpu_id'] == gid]
-        ax.plot(gdf['elapsed_seconds'], gdf['gpu_temp_c'], label=f'GPU {gid}', color=colors[i % 10], linewidth=0.8)
+        ax.plot(gdf['elapsed_seconds'], gdf['gpu_temp_c'], color=colors[i % 10], linewidth=0.8)
     ax.set_title('GPU Temperature (°C)')
     ax.grid(True, alpha=0.3)
     
-    # GPU Power
     ax = axes[0, 1]
     for i, gid in enumerate(gpu_ids):
         gdf = df[df['gpu_id'] == gid]
-        ax.plot(gdf['elapsed_seconds'], gdf['gpu_power_w'], label=f'GPU {gid}', color=colors[i % 10], linewidth=0.8)
+        ax.plot(gdf['elapsed_seconds'], gdf['gpu_power_w'], color=colors[i % 10], linewidth=0.8)
     ax.set_title('GPU Power (W)')
     ax.grid(True, alpha=0.3)
     
-    # GPU TFLOPS
-    ax = axes[0, 2]
-    for i, gid in enumerate(gpu_ids):
-        gdf = df[df['gpu_id'] == gid]
-        ax.plot(gdf['elapsed_seconds'], gdf['gpu_tflops'], label=f'GPU {gid}', color=colors[i % 10], linewidth=0.8)
-    ax.set_title('GPU TFLOPS')
-    ax.grid(True, alpha=0.3)
-    
-    # GPU Fan
     ax = axes[1, 0]
     for i, gid in enumerate(gpu_ids):
         gdf = df[df['gpu_id'] == gid]
-        ax.plot(gdf['elapsed_seconds'], gdf['gpu_fan_pct'], label=f'GPU {gid}', color=colors[i % 10], linewidth=0.8)
-    ax.set_title('GPU Fan (%)')
+        ax.plot(gdf['elapsed_seconds'], gdf['gpu_tflops'], color=colors[i % 10], linewidth=0.8)
+    ax.set_title('GPU TFLOPS')
     ax.grid(True, alpha=0.3)
     
-    # System Temp
     ax = axes[1, 1]
-    if sdf['inlet_temp_c'].any():
-        ax.plot(sdf['elapsed_seconds'], sdf['inlet_temp_c'], label='Inlet', linewidth=1)
-    if sdf['exhaust_temp_c'].any():
-        ax.plot(sdf['elapsed_seconds'], sdf['exhaust_temp_c'], label='Exhaust', linewidth=1)
-    ax.set_title('System Temp (°C)')
-    ax.legend(fontsize=8)
-    ax.grid(True, alpha=0.3)
-    
-    # System Power
-    ax = axes[1, 2]
-    if sdf['psu_power_w'].any():
-        ax.plot(sdf['elapsed_seconds'], sdf['psu_power_w'], label='PSU', linewidth=1)
-    if sdf['cpu_power_w'].any():
-        ax.plot(sdf['elapsed_seconds'], sdf['cpu_power_w'], label='CPU', linewidth=1)
-    ax.set_title('System Power (W)')
-    ax.legend(fontsize=8)
+    # 總功耗
+    total_power = df.groupby('elapsed_seconds')['gpu_power_w'].sum()
+    ax.plot(total_power.index, total_power.values, color='red', linewidth=1)
+    ax.set_title('Total GPU Power (W)')
     ax.grid(True, alpha=0.3)
     
     fig.suptitle(f'GPU Burn Test: {csv_path.stem}', fontsize=14)
@@ -423,37 +426,10 @@ def generate_charts(csv_path: str):
     plt.close()
     
     print(f"Charts saved to: {chart_dir}/")
-    
-    # 印出統計
-    print("\n" + "=" * 50)
-    print("Statistics:")
-    print("=" * 50)
-    print(f"  Duration:       {df['elapsed_seconds'].max():.0f}s")
-    print(f"  GPU Count:      {len(gpu_ids)}")
-    print(f"  Max GPU Temp:   {df['gpu_temp_c'].max():.1f}°C")
-    print(f"  Avg GPU Temp:   {df['gpu_temp_c'].mean():.1f}°C")
-    print(f"  Max GPU Power:  {df['gpu_power_w'].max():.1f}W")
-    print(f"  Avg GPU Power:  {df['gpu_power_w'].mean():.1f}W")
-    print(f"  Total GPU Power:{df.groupby('elapsed_seconds')['gpu_power_w'].sum().mean():.0f}W (avg)")
-    if (df['gpu_tflops'] > 0).any():
-        print(f"  Max TFLOPS:     {df['gpu_tflops'].max():.2f}")
-        print(f"  Avg TFLOPS:     {df[df['gpu_tflops'] > 0]['gpu_tflops'].mean():.2f}")
-    if sdf['psu_power_w'].any():
-        print(f"  Max PSU Power:  {sdf['psu_power_w'].max():.0f}W")
-    print("=" * 50)
 
 
 def main():
-    parser = argparse.ArgumentParser(
-        description='GPU Burn Monitor',
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog='''
-範例:
-  %(prog)s -d 300 -pl 400              # 300秒, 400W power limit
-  %(prog)s -d 60 --no-tc               # 60秒, 不使用 tensor cores  
-  %(prog)s --chart results/xxx.csv     # 從 CSV 產生圖表
-        '''
-    )
+    parser = argparse.ArgumentParser(description='GPU Burn Monitor v2')
     
     parser.add_argument('-d', '--duration', type=int, default=60, help='測試時間 (秒)')
     parser.add_argument('-pl', '--power-limit', type=int, help='GPU Power Limit (W)')
@@ -463,19 +439,16 @@ def main():
     parser.add_argument('-o', '--output', default='./results', help='輸出目錄')
     parser.add_argument('-i', '--interval', type=float, default=1.0, help='取樣間隔 (秒)')
     parser.add_argument('--gpu-burn', default='./gpu_burn', help='gpu_burn 路徑')
-    parser.add_argument('--chart', type=str, help='從 CSV 產生圖表 (不執行測試)')
+    parser.add_argument('--chart', type=str, help='從 CSV 產生圖表')
     
     args = parser.parse_args()
     
-    # 只產生圖表
     if args.chart:
         generate_charts(args.chart)
         return
     
-    # 檢查 gpu_burn
     if not os.path.isfile(args.gpu_burn):
         print(f"Error: gpu_burn not found: {args.gpu_burn}")
-        print("Use --gpu-burn to specify path")
         sys.exit(1)
     
     use_tc = args.tensor_cores and not args.no_tc
@@ -492,7 +465,6 @@ def main():
     
     csv_path = monitor.run()
     
-    # 產生圖表
     print("\nGenerating charts...")
     generate_charts(csv_path)
 
