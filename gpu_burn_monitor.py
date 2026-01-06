@@ -126,15 +126,15 @@ class GPUBurnMonitor:
                 print(f"Warning: Could not set power limit for GPU {i}: {e}")
     
     def parse_tflops(self, line: str):
-        # GPU 0: 12345 Gflop/s 或 GPU 0: 12.3 Tflop/s
-        m = re.search(r'GPU\s*(\d+).*?(\d+\.?\d*)\s*(G|T)flop', line, re.IGNORECASE)
-        if m:
-            gpu_id = int(m.group(1))
-            val = float(m.group(2))
-            unit = m.group(3).upper()
-            if unit == 'G':
-                val /= 1000.0
-            self.tflops[gpu_id] = val
+        # 格式: proc'd: 85 (18624 Gflop/s) - 43 (18937 Gflop/s) - ...
+        if 'proc\'d:' in line or 'Gflop/s' in line or 'Tflop/s' in line:
+            # 找出所有 (數字 Gflop/s) 或 (數字 Tflop/s)
+            matches = re.findall(r'\((\d+\.?\d*)\s*(G|T)flop/s\)', line, re.IGNORECASE)
+            for gpu_id, (val, unit) in enumerate(matches):
+                val = float(val)
+                if unit.upper() == 'G':
+                    val /= 1000.0  # 轉換為 TFLOPS
+                self.tflops[gpu_id] = val
     
     def read_output(self):
         while self.running and self.process and self.process.poll() is None:
