@@ -177,7 +177,6 @@ class GPUBurnMonitor:
                 if not line:
                     time.sleep(0.1)
                     continue
-                
                 # 處理 \r 覆寫的行（進度更新）
                 if '\r' in line:
                     # 取最後一個 \r 之後的內容
@@ -189,7 +188,7 @@ class GPUBurnMonitor:
                     
             except Exception as e:
                 break
-    
+ 
     def collect(self) -> list:
         ts = datetime.now().isoformat()
         elapsed = time.time() - self.start_time if self.start_time else 0

@@ -181,8 +181,6 @@ class GPUBurnMonitor:
         # 處理最後的 buffer
         if buffer and 'Gflop/s' in buffer:
             self.parse_tflops(buffer)
-            except:
-                break
     
     def collect(self) -> list:
         ts = datetime.now().isoformat()
