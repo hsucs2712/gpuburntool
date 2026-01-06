@@ -166,10 +166,15 @@ class GPUBurnMonitor:
                 if line:
                     line = line.strip()
                     if line:
-                        self.parse_tflops(line)
-                        # 只印重要訊息，避免畫面混亂
-                        if 'error' in line.lower() or 'GPU' in line or 'proc\'d' in line.lower():
-                            print(f"[gpu_burn] {line}")
+                        # 解析 TFLOPS
+                        if 'Gflop/s' in line or 'Tflop/s' in line:
+                            self.parse_tflops(line)
+                        # 印出重要訊息
+                        if 'error' in line.lower() or 'proc\'d' in line.lower() or 'GPU' in line:
+                            print(f"\n[gpu_burn] {line}")
+            except Exception as e:
+                print(f"\n[read error] {e}")
+                break
             except:
                 break
     
@@ -245,15 +250,27 @@ class GPUBurnMonitor:
         print(f"Output: {csv_path}")
         print("-" * 70)
         
-        # 啟動 gpu_burn，合併 stdout 和 stderr
-        self.process = subprocess.Popen(
-            cmd, 
-            stdout=subprocess.PIPE, 
-            stderr=subprocess.STDOUT,
-            text=True, 
-            bufsize=1,
-            universal_newlines=True
-        )
+        # 啟動 gpu_burn，用 stdbuf 關閉 buffering
+        cmd_with_stdbuf = ['stdbuf', '-oL', '-eL'] + cmd
+        try:
+            self.process = subprocess.Popen(
+                cmd_with_stdbuf, 
+                stdout=subprocess.PIPE, 
+                stderr=subprocess.STDOUT,
+                text=True, 
+                bufsize=1,
+                universal_newlines=True
+            )
+        except FileNotFoundError:
+            # 如果沒有 stdbuf，用原本的方式
+            self.process = subprocess.Popen(
+                cmd, 
+                stdout=subprocess.PIPE, 
+                stderr=subprocess.STDOUT,
+                text=True, 
+                bufsize=1,
+                universal_newlines=True
+            )
         self.running = True
         self.start_time = time.time()
         
