@@ -157,24 +157,30 @@ class GPUBurnMonitor:
                 self.tflops[gpu_id] = val
     
     def read_output(self):
-        """持續讀取 gpu_burn 輸出"""
+        """持續讀取 gpu_burn 輸出 - 處理 \r 換行"""
+        buffer = ""
         while self.running:
             if self.process is None or self.process.poll() is not None:
                 break
             try:
-                line = self.process.stdout.readline()
-                if line:
-                    line = line.strip()
-                    if line:
-                        # 解析 TFLOPS
-                        if 'Gflop/s' in line or 'Tflop/s' in line:
-                            self.parse_tflops(line)
-                        # 印出重要訊息
-                        if 'error' in line.lower() or 'proc\'d' in line.lower() or 'GPU' in line:
-                            print(f"\n[gpu_burn] {line}")
+                # 一次讀一個字元
+                char = self.process.stdout.read(1)
+                if not char:
+                    continue
+                
+                if char == '\r' or char == '\n':
+                    # 處理完整的一行
+                    if buffer and 'Gflop/s' in buffer:
+                        self.parse_tflops(buffer)
+                    buffer = ""
+                else:
+                    buffer += char
             except Exception as e:
-                print(f"\n[read error] {e}")
                 break
+        
+        # 處理最後的 buffer
+        if buffer and 'Gflop/s' in buffer:
+            self.parse_tflops(buffer)
             except:
                 break
     
