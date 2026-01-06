@@ -14,6 +14,7 @@ from pathlib import Path
 from dataclasses import dataclass, asdict
 from threading import Thread, Lock
 import re
+import select
 
 @dataclass
 class SensorData:
@@ -28,8 +29,6 @@ class SensorData:
     gpu_mem_total_mb: float
     gpu_util_pct: float
     gpu_tflops: float
-    gpu_errors: int
-    gpu_burn_temp_c: float
     inlet_temp_c: float
     exhaust_temp_c: float
     cpu_temp_c: float
@@ -59,10 +58,8 @@ class GPUBurnMonitor:
         self.running = False
         self.start_time = None
         self.tflops: dict = {}
-        self.errors: dict = {}
-        self.burn_temps: dict = {}
-        self.data_lock = Lock()
-        self.gpu_count = 8  # 預設,會自動偵測
+        self.tflops_lock = Lock()
+        self.gpu_count = 8  # 預設，會自動偵測
         
     def get_gpu_count(self) -> int:
         try:
@@ -132,62 +129,59 @@ class GPUBurnMonitor:
     
     def parse_tflops(self, line: str):
         """
-        解析 gpu-burn 輸出格式:
-        100.0%  proc'd: 3185 (14458 Gflop/s) - 3185 (14759 Gflop/s) - ... 
-        errors: 0 - 0 - 0 - ... 
-        temps: 38 C - 41 C - 42 C - ...
+        解析多種 gpu-burn 輸出格式:
+        1. proc'd: 85 (18624 Gflop/s) - 43 (18937 Gflop/s) - ...
+        2. GPU 0: xxxx Gflop/s
+        3. 100.0%  proc'd: ...
         """
-        try:
-            # 解析 Gflop/s 數據
-            gflops_matches = re.findall(r'\((\d+\.?\d*)\s*Gflop/s\)', line)
-            if gflops_matches:
-                with self.data_lock:
-                    for gpu_id, val in enumerate(gflops_matches):
-                        self.tflops[gpu_id] = float(val) / 1000.0  # 轉換為 TFLOPS
-            
-            # 解析錯誤數
-            if 'errors:' in line:
-                errors_part = line.split('errors:')[1].split('temps:')[0] if 'temps:' in line else line.split('errors:')[1]
-                error_values = re.findall(r'(\d+)', errors_part)
-                with self.data_lock:
-                    for gpu_id, val in enumerate(error_values):
-                        self.errors[gpu_id] = int(val)
-            
-            # 解析 gpu_burn 報告的溫度
-            if 'temps:' in line:
-                temps_part = line.split('temps:')[1]
-                temp_values = re.findall(r'(\d+\.?\d*)\s*C', temps_part)
-                with self.data_lock:
-                    for gpu_id, val in enumerate(temp_values):
-                        self.burn_temps[gpu_id] = float(val)
-                        
-        except Exception as e:
-            # 靜默處理解析錯誤,避免干擾主程序
-            pass
+        # 格式 1: (數字 Gflop/s) 連續出現
+        matches = re.findall(r'\((\d+\.?\d*)\s*(G|T)flop/s\)', line, re.IGNORECASE)
+        if matches:
+            with self.tflops_lock:
+                for gpu_id, (val, unit) in enumerate(matches):
+                    val = float(val)
+                    if unit.upper() == 'G':
+                        val /= 1000.0
+                    self.tflops[gpu_id] = val
+            return
+        
+        # 格式 2: GPU N: xxxx Gflop/s
+        m = re.search(r'GPU\s*(\d+)[:\s]+(\d+\.?\d*)\s*(G|T)flop', line, re.IGNORECASE)
+        if m:
+            gpu_id = int(m.group(1))
+            val = float(m.group(2))
+            unit = m.group(3).upper()
+            if unit == 'G':
+                val /= 1000.0
+            with self.tflops_lock:
+                self.tflops[gpu_id] = val
     
     def read_output(self):
-        """持續讀取 gpu_burn 輸出"""
+        """持續讀取 gpu_burn 輸出 - 處理 \r 換行"""
         buffer = ""
         while self.running:
             if self.process is None or self.process.poll() is not None:
                 break
             try:
-                # 使用 readline 而非單字符讀取,提高效率
-                line = self.process.stdout.readline()
-                if not line:
-                    time.sleep(0.1)
+                # 一次讀一個字元
+                char = self.process.stdout.read(1)
+                if not char:
                     continue
                 
-                # 處理 \r 覆寫的行（進度更新）
-                if '\r' in line:
-                    # 取最後一個 \r 之後的內容
-                    line = line.split('\r')[-1]
-                
-                line = line.strip()
-                if line and ('Gflop/s' in line or 'errors:' in line or 'temps:' in line):
-                    self.parse_tflops(line)
-                    
+                if char == '\r' or char == '\n':
+                    # 處理完整的一行
+                    if buffer and 'Gflop/s' in buffer:
+                        self.parse_tflops(buffer)
+                    buffer = ""
+                else:
+                    buffer += char
             except Exception as e:
+                break
+        
+        # 處理最後的 buffer
+        if buffer and 'Gflop/s' in buffer:
+            self.parse_tflops(buffer)
+            except:
                 break
     
     def collect(self) -> list:
@@ -204,17 +198,14 @@ class GPUBurnMonitor:
         mem_pwr = self.get_ipmi_sensor(['mem power', 'memory power', 'dimm power'])
         
         samples = []
-        with self.data_lock:
+        with self.tflops_lock:
             current_tflops = dict(self.tflops)
-            current_errors = dict(self.errors)
-            current_burn_temps = dict(self.burn_temps)
         
         for gpu in gpus:
-            gid = gpu['id']
             s = SensorData(
                 timestamp=ts,
                 elapsed_seconds=round(elapsed, 2),
-                gpu_id=gid,
+                gpu_id=gpu['id'],
                 gpu_name=gpu['name'],
                 gpu_temp_c=gpu['temp'],
                 gpu_power_w=gpu['power'],
@@ -222,9 +213,7 @@ class GPUBurnMonitor:
                 gpu_mem_used_mb=gpu['mem_used'],
                 gpu_mem_total_mb=gpu['mem_total'],
                 gpu_util_pct=gpu['util'],
-                gpu_tflops=round(current_tflops.get(gid, 0), 3),
-                gpu_errors=current_errors.get(gid, 0),
-                gpu_burn_temp_c=current_burn_temps.get(gid, 0),
+                gpu_tflops=round(current_tflops.get(gpu['id'], 0), 3),
                 inlet_temp_c=inlet,
                 exhaust_temp_c=exhaust,
                 cpu_temp_c=cpu_temp,
@@ -267,7 +256,7 @@ class GPUBurnMonitor:
         print(f"Output: {csv_path}")
         print("-" * 70)
         
-        # 啟動 gpu_burn,用 stdbuf 關閉 buffering
+        # 啟動 gpu_burn，用 stdbuf 關閉 buffering
         cmd_with_stdbuf = ['stdbuf', '-oL', '-eL'] + cmd
         try:
             self.process = subprocess.Popen(
@@ -279,7 +268,7 @@ class GPUBurnMonitor:
                 universal_newlines=True
             )
         except FileNotFoundError:
-            # 如果沒有 stdbuf,用原本的方式
+            # 如果沒有 stdbuf，用原本的方式
             self.process = subprocess.Popen(
                 cmd, 
                 stdout=subprocess.PIPE, 
@@ -288,7 +277,6 @@ class GPUBurnMonitor:
                 bufsize=1,
                 universal_newlines=True
             )
-        
         self.running = True
         self.start_time = time.time()
         
@@ -306,14 +294,12 @@ class GPUBurnMonitor:
                 
                 if samples:
                     s = samples[0]
-                    # 計算總 TFLOPS 和總錯誤數
-                    with self.data_lock:
+                    # 計算總 TFLOPS
+                    with self.tflops_lock:
                         total_tflops = sum(self.tflops.values())
-                        total_errors = sum(self.errors.values())
                     
                     print(f"\r[{s.elapsed_seconds:6.1f}s] GPU0: {s.gpu_temp_c:5.1f}°C {s.gpu_power_w:6.1f}W | "
                           f"TFLOPS: {s.gpu_tflops:6.2f} (Total: {total_tflops:6.2f}) | "
-                          f"Errors: {total_errors} | "
                           f"Inlet:{s.inlet_temp_c:5.1f}°C PSU:{s.psu_power_w:6.0f}W", end="", flush=True)
                 
                 time.sleep(self.interval)
@@ -351,7 +337,6 @@ class GPUBurnMonitor:
         temps = [d.gpu_temp_c for d in self.data]
         powers = [d.gpu_power_w for d in self.data]
         tflops_vals = [d.gpu_tflops for d in self.data if d.gpu_tflops > 0]
-        errors = [d.gpu_errors for d in self.data]
         
         print("\n" + "=" * 50)
         print("Statistics:")
@@ -365,7 +350,6 @@ class GPUBurnMonitor:
         if tflops_vals:
             print(f"  Max TFLOPS:     {max(tflops_vals):.2f}")
             print(f"  Avg TFLOPS:     {sum(tflops_vals)/len(tflops_vals):.2f}")
-        print(f"  Total Errors:   {max(errors)}")
         print("=" * 50)
 
 
@@ -428,20 +412,7 @@ def generate_charts(csv_path: str):
     fig.savefig(chart_dir / '03_gpu_tflops.png', dpi=150, bbox_inches='tight')
     plt.close()
     
-    # 4. GPU 錯誤數
-    fig, ax = plt.subplots(figsize=(12, 6))
-    for i, gid in enumerate(gpu_ids):
-        gdf = df[df['gpu_id'] == gid]
-        ax.plot(gdf['elapsed_seconds'], gdf['gpu_errors'], label=f'GPU {gid}', color=colors[i % 10])
-    ax.set_xlabel('Time (s)')
-    ax.set_ylabel('Errors')
-    ax.set_title('GPU Errors')
-    ax.legend(loc='upper right')
-    ax.grid(True, alpha=0.3)
-    fig.savefig(chart_dir / '04_gpu_errors.png', dpi=150, bbox_inches='tight')
-    plt.close()
-    
-    # 5. 總覽
+    # 4. 總覽
     fig, axes = plt.subplots(2, 2, figsize=(14, 10))
     
     ax = axes[0, 0]
