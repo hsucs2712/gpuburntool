@@ -175,14 +175,12 @@ class GPUBurnMonitor:
                     buffer = ""
                 else:
                     buffer += char
-            except Exception as e:
+            except Exception as e:  # 這裡修正縮排與異常處理
                 break
         
         # 處理最後的 buffer
         if buffer and 'Gflop/s' in buffer:
             self.parse_tflops(buffer)
-            except:
-                break
     
     def collect(self) -> list:
         ts = datetime.now().isoformat()
